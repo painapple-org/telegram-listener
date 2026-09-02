@@ -1,7 +1,5 @@
 import asyncio
-import json
 import os
-import unittest.mock
 
 import pytest
 
@@ -19,12 +17,12 @@ class RecordingPlugin:
 
     async def handle_turn(self, turn, api):
         self.turns.append(turn)
-        api.send_message(turn.chat_id, f"echo: {turn.text}")
+        await api.send_message(turn.chat_id, f"echo: {turn.text}")
 
     async def handle_command(self, chat_id, message_id, command, argument, api):
         self.commands.append((chat_id, message_id, command, argument))
         if command == "known":
-            api.send_message(chat_id, "handled")
+            await api.send_message(chat_id, "handled")
             return True
         return False
 
@@ -44,11 +42,171 @@ def make_message(text, message_id=1, chat_id=100, sender_id=42, sender_name="Xan
     return message
 
 
+def make_update(message, update_id=1, key="message"):
+    return {"update_id": update_id, key: message}
+
+
 class TestAllowlist:
     def test_disallowed_sender_is_dropped(self):
         lst = listener.Listener(plugin=RecordingPlugin(), api_base="http://fake", allowed_user_ids={1})
         asyncio.run(lst.handle_message(make_message("hi", sender_id=999)))
         assert lst.plugin.turns == []
+
+    def test_allowlisted_sender_in_unlisted_chat_is_dropped(self):
+        lst = listener.Listener(
+            plugin=RecordingPlugin(), api_base="http://fake",
+            allowed_user_ids={42}, allowed_chat_ids={555},
+        )
+        asyncio.run(lst.handle_message(make_message("hi", sender_id=42, chat_id=100)))
+        assert lst.plugin.turns == []
+
+    def test_empty_chat_allowlist_permits_any_chat(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        lst = listener.Listener(
+            plugin=RecordingPlugin(), api_base="http://fake",
+            allowed_user_ids={42}, allowed_chat_ids=set(),
+        )
+
+        async def go():
+            await lst.handle_message(make_message("hi", sender_id=42, chat_id=100))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        assert len(lst.plugin.turns) == 1
+
+    def test_empty_user_allowlist_refuses_to_start(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "")
+        with pytest.raises(RuntimeError, match="allowlist nobody"):
+            listener._allowed_user_ids()
+
+
+class TestRawUpdateLog:
+    def test_disallowed_senders_content_is_never_written_to_disk(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        lst = listener.Listener(plugin=RecordingPlugin(), api_base="http://fake", allowed_user_ids={42})
+
+        asyncio.run(lst.handle_update(make_update(make_message("secret text", sender_id=999))))
+
+        assert not os.path.exists(listener.RAW_UPDATES_LOG)
+
+    def test_allowed_senders_update_is_recorded(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        lst = listener.Listener(plugin=RecordingPlugin(), api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_update(make_update(make_message("hello", sender_id=42)))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        with open(listener.RAW_UPDATES_LOG) as f:
+            assert "hello" in f.read()
+
+
+class TestEditedMessages:
+    def test_an_edit_does_not_rerun_the_turn(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        plugin = RecordingPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_update(make_update(
+                make_message("fixed typo", sender_id=42), key="edited_message"))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        assert plugin.turns == []
+
+
+class TestSenderAttribution:
+    def test_each_turn_reports_its_own_sender(self, monkeypatch):
+        """A batcher lives for the whole process, so a group chat's second
+        turn must not be attributed to whoever spoke first."""
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        plugin = RecordingPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42, 43})
+
+        async def go():
+            await lst.handle_message(make_message("from a", message_id=1, sender_id=42, sender_name="Xander"))
+            await asyncio.sleep(0.05)
+            await lst.handle_message(make_message("from b", message_id=2, sender_id=43, sender_name="David"))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        assert [(t.sender_name, t.sender_id) for t in plugin.turns] == [("Xander", 42), ("David", 43)]
+
+
+class TestTurnSerialization:
+    def test_turns_for_one_chat_never_overlap(self, monkeypatch):
+        """A plugin holds per-chat state a concurrent second turn would
+        corrupt, and a turn can outlast the next batch's quiet period."""
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+
+        class SlowPlugin(RecordingPlugin):
+            def __init__(self):
+                super().__init__()
+                self.concurrent = 0
+                self.max_concurrent = 0
+
+            async def handle_turn(self, turn, api):
+                self.concurrent += 1
+                self.max_concurrent = max(self.max_concurrent, self.concurrent)
+                await asyncio.sleep(0.05)
+                self.concurrent -= 1
+                self.turns.append(turn)
+
+        plugin = SlowPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_message(make_message("one", message_id=1))
+            await asyncio.sleep(0.01)
+            await lst.handle_message(make_message("two", message_id=2))
+            await asyncio.sleep(0.3)
+
+        asyncio.run(go())
+        assert plugin.max_concurrent == 1
+        assert len(plugin.turns) == 2
+
+    def test_a_new_message_does_not_kill_a_running_turn(self, monkeypatch):
+        """A later message restarts the quiet-period timer. That must not
+        cancel a turn already being dispatched."""
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+
+        class SlowPlugin(RecordingPlugin):
+            async def handle_turn(self, turn, api):
+                await asyncio.sleep(0.1)
+                self.turns.append(turn)
+
+        plugin = SlowPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_message(make_message("one", message_id=1))
+            await asyncio.sleep(0.02)
+            await lst.handle_message(make_message("two", message_id=2))
+            await asyncio.sleep(0.5)
+
+        asyncio.run(go())
+        assert [t.message_ids for t in plugin.turns] == [[1], [2]]
+
+
+class TestResponseChecking:
+    def test_an_http_error_never_quotes_the_request_url(self):
+        """`requests.raise_for_status` puts the token-bearing URL into its
+        message, and that message reaches logs and plugin code."""
+        from tests.fakes import FakeResponse
+
+        resp = FakeResponse({}, status_code=401)
+        with pytest.raises(RuntimeError) as caught:
+            listener._check_response(resp, "getUpdates")
+        assert "getUpdates" in str(caught.value)
+        assert "bot" not in str(caught.value)
 
 
 class TestTurnDispatch:

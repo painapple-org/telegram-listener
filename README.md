@@ -33,6 +33,32 @@ What happens with a batched turn is entirely up to a `DispatchPlugin`
 - `tests/` - a fake-HTTP-client based test suite; no live network, no live
   Claude calls.
 
+## Access control
+
+The whole model, and it is worth understanding before pointing a
+privileged plugin at it:
+
+- `TELEGRAM_ALLOWED_USER_IDS` (required) — every message and every
+  inline-keyboard callback is gated on the numeric sender ID. The listener
+  refuses to start on an empty allowlist rather than run allowlisting
+  nobody. Drops are logged with their reason.
+- `TELEGRAM_ALLOWED_CHAT_IDS` (optional) — additionally gate on *which
+  chat* the message came from. Empty means an allowlisted person can drive
+  the bot from any chat, including a group a stranger added it to. See
+  `SETUP.md` §3b for why that matters and when to set it.
+- Nothing from a non-allowlisted sender is written to disk or allocated
+  per-chat state; the gate runs before either.
+- The bot token is never written to a log file — `requests` puts it in
+  every URL it quotes, so error paths report endpoint names only and all
+  log output passes through `redact` in `telegram_listener/common.py`.
+
+One thing this cannot gate: text a non-allowlisted person wrote can still
+reach a plugin *indirectly*, as quoted or forwarded content inside an
+allowlisted person's message. The turn text labels it as such (see
+`describe_message_provenance`), but a plugin that acts on instructions
+found in a turn body is trusting that labelling — treat forwarded and
+quoted content as untrusted input.
+
 ## Writing your own plugin
 
 Implement `telegram_listener.plugin.DispatchPlugin`:
@@ -48,6 +74,13 @@ Point `DISPATCH_PLUGIN` at `module.path:factory_function`, where
 `factory_function()` returns an instance of your plugin. See
 `plugins/claude_agent.py` for a complete example.
 
+`ListenerAPI`'s send primitives (`send_message`, `send_typing`,
+`set_reaction`, `send_document`) are all awaitable — they wrap blocking
+HTTP calls, and running one inline would stall the shared poll loop and
+every other chat for the length of the request. `log` is the one
+synchronous member. The listener guarantees one `handle_turn` at a time per
+chat, so a plugin's own per-chat state needs no locking of its own.
+
 ## Running
 
 Starting from zero (no bot, no `my.telegram.org` app, no allowlisted user
@@ -56,9 +89,14 @@ ID yet)? See [`SETUP.md`](SETUP.md) for how to obtain every value below.
 ```
 cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, etc.
 uv sync --extra claude-agent-plugin   # or omit the extra if your own plugin doesn't need it
-cd installer && docker compose up -d telegram-bot-api
+docker compose -f installer/docker-compose.yml --env-file .env up -d telegram-bot-api
 uv run python -m telegram_listener.listener
 ```
+
+`--env-file .env` is not optional: the compose file lives in `installer/`
+but `.env` is at the repo root, so without it compose looks for an
+`installer/.env` that isn't there and the container starts with no
+`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`.
 
 For a persistent host install (systemd `--user` unit + linger), see
 `installer/install.sh`.
@@ -72,5 +110,10 @@ follow by hand.
 ## Testing
 
 ```
+uv sync
 uv run pytest
 ```
+
+The core listener's tests run on core dependencies alone. The example
+plugin's own tests need the optional extra (`uv sync --extra
+claude-agent-plugin`) and skip without it.

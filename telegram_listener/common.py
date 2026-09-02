@@ -12,6 +12,7 @@ it through the optional `ListenerAPI.on_event` callback instead (see
 
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -19,25 +20,50 @@ import time
 
 
 def resolve_data_dir():
+    explicit = os.environ.get("TELEGRAM_LISTENER_DATA_DIR")
+    if explicit:
+        return explicit
     if os.path.isdir("/data"):
         return "/data"
-    return os.environ.get("TELEGRAM_LISTENER_DATA_DIR", os.path.join(os.getcwd(), "data"))
+    return os.path.join(os.getcwd(), "data")
 
 
-def resolve_bot_api_base(bot_token, service_hostname="telegram-bot-api"):
+def resolve_bot_api_base(bot_token, service_hostname=None):
     """Resolve the self-hosted local Bot API server's base URL.
 
     Prefers the Docker-compose service hostname (see
     installer/docker-compose.yml) when it resolves, falling back to
     localhost for a bare host process talking to a port-published
-    container.
+    container. Both the hostname and the port are overridable for a
+    deployment that publishes the container somewhere else.
     """
+    service_hostname = service_hostname or os.environ.get("TELEGRAM_BOT_API_HOST", "telegram-bot-api")
+    port = int(os.environ.get("TELEGRAM_BOT_API_PORT", "8081"))
     try:
         socket.gethostbyname(service_hostname)
         host = service_hostname
     except socket.gaierror:
         host = "127.0.0.1"
-    return f"http://{host}:8081/bot{bot_token}"
+    return f"http://{host}:{port}/bot{bot_token}"
+
+
+_TOKEN_IN_URL = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
+
+
+def redact(text):
+    """Strip the bot token out of `text` before it reaches a log file.
+
+    The Bot API carries the token in the URL path, so a `requests`
+    connection error, an HTTP error and any traceback through this code all
+    quote it verbatim. The token is a password - anyone holding it can read
+    and send this bot's messages - and log files get tailed, pasted into
+    chat and shipped off the host, so it must never be written to one.
+    """
+    text = str(text)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if token:
+        text = text.replace(token, "<redacted>")
+    return _TOKEN_IN_URL.sub("/bot<redacted>", text)
 
 
 TRANSCRIPT_FILE = os.path.join(resolve_data_dir(), "telegram-listener", "transcript.jsonl")
