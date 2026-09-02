@@ -50,6 +50,9 @@ Point `DISPATCH_PLUGIN` at `module.path:factory_function`, where
 
 ## Running
 
+Starting from zero (no bot, no `my.telegram.org` app, no allowlisted user
+ID yet)? See [`SETUP.md`](SETUP.md) for how to obtain every value below.
+
 ```
 cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, etc.
 uv sync --extra claude-agent-plugin   # or omit the extra if your own plugin doesn't need it
