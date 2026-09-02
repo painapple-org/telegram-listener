@@ -15,7 +15,7 @@ and must return a `DispatchPlugin`.
 
 import importlib
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, Protocol
 
 
@@ -41,11 +41,21 @@ class Turn:
 @dataclass
 class ListenerAPI:
     """What a plugin is given to act with - the listener's own send/react/log
-    primitives, so a plugin never talks to the Telegram Bot API directly."""
+    primitives, so a plugin never talks to the Telegram Bot API directly.
 
-    send_message: Callable[[int, str], None]
-    send_typing: Callable[[int], None]
-    set_reaction: Callable[[int, int, str], None]
+    Every send/react primitive is awaitable and must be awaited. They wrap
+    blocking HTTP calls, so calling one without awaiting it both loses the
+    call and, if it were run inline instead, would stall the shared poll
+    loop and every other chat for the duration of the request. `log` is the
+    exception: a plain synchronous local file append.
+    """
+
+    send_message: Callable[[int, str], Awaitable[None]]
+    send_typing: Callable[[int], Awaitable[None]]
+    set_reaction: Callable[[int, int, str], Awaitable[None]]
+    # Send a local file to a chat. The listener talks to a self-hosted Bot
+    # API server precisely so this isn't capped at the cloud API's 20MB.
+    send_document: Callable[..., Awaitable[None]]
     log: Callable[[str], None]
     # Optional event-notification hook (e.g. for a dashboard/activity feed
     # downstream). None unless the process wiring it up actually wants one -

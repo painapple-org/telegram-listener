@@ -41,7 +41,12 @@ trusting the list below to have stayed in sync — is, as of this doc:
    allowed to talk to this bot, comma-separated. If the human doesn't
    already know their own numeric ID, the simplest path is telling them to
    message @userinfobot on Telegram and read back the number it replies
-   with.
+   with. This one is mandatory: the listener refuses to start without it
+   rather than run allowlisting nobody.
+   Also raise **`TELEGRAM_ALLOWED_CHAT_IDS`** (optional) with them rather
+   than quietly leaving it blank — `SETUP.md` §3b explains the exposure it
+   closes. If the plugin being wired up has real tool access, recommend
+   setting it, and get the chat IDs while you're already asking for IDs.
 4. **`DISPATCH_PLUGIN`** — not a credential, but still a required `.env`
    value: which dispatch plugin the listener loads at startup, in
    `module.path:factory` form. Don't ask the human to guess this — see
@@ -122,13 +127,21 @@ chat, not by looking for a further transcript line.
   `EnvironmentFile=` points straight at this repo's `.env`, so a typo'd key
   name there is silent until the process actually reads it.
 - **Listener runs but no messages ever arrive.** Check
-  `docker compose -f installer/docker-compose.yml ps` — the
+  `docker compose -f installer/docker-compose.yml --env-file .env ps` — the
   `telegram-bot-api` container has to be up first, since the listener talks
   to it (not directly to `api.telegram.org`) for `getUpdates`. If it's not
   up, check `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are actually set in
   `.env` before it was brought up (a compose service reads `.env` at
-  `up` time, not continuously — `docker compose up -d telegram-bot-api`
-  again after fixing `.env`).
+  `up` time, not continuously — re-run
+  `docker compose -f installer/docker-compose.yml --env-file .env up -d telegram-bot-api`
+  after fixing `.env`). Always pass `--env-file .env` from the repo root:
+  the compose file is in `installer/`, so compose would otherwise look for
+  a nonexistent `installer/.env` and bring the container up with no
+  credentials at all.
+- **An allowlisted person's messages are ignored in one particular chat.**
+  Check whether `TELEGRAM_ALLOWED_CHAT_IDS` is set (see `SETUP.md` §3b) —
+  when it is, both the sender *and* the chat have to be allowlisted. The
+  listener logs the exact reason for every drop.
 - **Considering running the listener itself in a container instead of via
   the systemd `--user` unit the installer sets up — don't.** This repo's
   installer deliberately runs the listener as a real host process, not a
@@ -173,10 +186,20 @@ The interface, in short:
   Telegram fields.
 - **`ListenerAPI`** — what a plugin acts back through:
   `send_message(chat_id, text)`, `send_typing(chat_id)`,
-  `set_reaction(chat_id, message_id, emoji)`, `log(text)`, and an optional
-  `on_event(name, payload)` hook for a downstream dashboard/activity feed
-  (`None` unless the process wiring the plugin up actually wants one — a
-  plugin must treat a missing hook as a no-op, never assume it exists).
+  `set_reaction(chat_id, message_id, emoji)`,
+  `send_document(chat_id, path, caption=None)`, `log(text)`, and an
+  optional `on_event(name, payload)` hook for a downstream
+  dashboard/activity feed (`None` unless the process wiring the plugin up
+  actually wants one — a plugin must treat a missing hook as a no-op, never
+  assume it exists). **Every send primitive is awaitable and must be
+  awaited** — they wrap blocking HTTP calls, so a forgotten `await` both
+  loses the call and, run inline, would stall the poll loop and every other
+  chat. `log` is the one synchronous member. `send_document` is uncapped
+  past whatever the self-hosted Bot API server allows, which is the whole
+  reason this package talks to one rather than to api.telegram.org.
+- **Concurrency guarantee** — the listener runs at most one `handle_turn`
+  at a time per chat, and a message arriving mid-turn does not cancel the
+  turn in flight. A plugin's per-chat state needs no locking of its own.
 - **`DispatchPlugin`** protocol — a plugin implements `async
   handle_turn(turn, api)` (called once per batched turn),
   `async handle_command(chat_id, message_id, command, argument, api) ->
@@ -242,4 +265,6 @@ own package's dependencies (not this repo's — see `pyproject.toml`'s
 `uv run pytest` after wiring a new plugin in — `tests/fakes.py` gives you a
 fake HTTP client to write a test against without hitting a live Telegram
 API, the same way `tests/test_claude_agent_plugin.py` tests the shipped
-example.
+example (that one's Claude-specific fakes live in `tests/plugin_fakes.py`,
+kept out of `tests/fakes.py` so the core tests stay runnable without the
+optional extra).

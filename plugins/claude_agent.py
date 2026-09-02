@@ -119,14 +119,14 @@ class ClaudeAgentPlugin:
             await client.disconnect()
 
     async def handle_turn(self, turn: Turn, api: ListenerAPI) -> None:
-        api.send_typing(turn.chat_id)
+        await api.send_typing(turn.chat_id)
         client = await self._client_for(turn.chat_id)
         await client.query(turn.text)
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
-                        api.send_message(turn.chat_id, block.text.strip())
+                        await api.send_message(turn.chat_id, block.text.strip())
 
     async def handle_command(self, chat_id, message_id, command, argument, api: ListenerAPI) -> bool:
         if command == "clear":
@@ -134,16 +134,16 @@ class ClaudeAgentPlugin:
             sessions = _load_sessions()
             sessions.pop(str(chat_id), None)
             _save_sessions(sessions)
-            api.set_reaction(chat_id, message_id, "\U0001F44D")
-            api.send_message(chat_id, "Cleared - next message starts a brand-new session.")
+            await api.set_reaction(chat_id, message_id, "\U0001F44D")
+            await api.send_message(chat_id, "Cleared - next message starts a brand-new session.")
             return True
         if command == "compact":
             client = await self._client_for(chat_id)
             await client.query("/compact")
             async for message in client.receive_response():
                 pass
-            api.set_reaction(chat_id, message_id, "\U0001F44D")
-            api.send_message(chat_id, "Compacted.")
+            await api.set_reaction(chat_id, message_id, "\U0001F44D")
+            await api.send_message(chat_id, "Compacted.")
             return True
         return False
 

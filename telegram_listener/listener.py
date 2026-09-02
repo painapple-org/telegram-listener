@@ -39,6 +39,11 @@ MESSAGE_BATCH_QUIET_SECONDS = int(os.environ.get("MESSAGE_BATCH_QUIET_SECONDS", 
 MESSAGE_BATCH_MAX_WAIT_SECONDS = int(os.environ.get("MESSAGE_BATCH_MAX_WAIT_SECONDS", 120))
 MESSAGE_BATCH_MAX_MESSAGES = int(os.environ.get("MESSAGE_BATCH_MAX_MESSAGES", 50))
 
+# The raw-update log is a debugging aid holding full message content, so it
+# both grows without bound and accumulates personal data. Cap it and keep
+# exactly one previous generation.
+RAW_UPDATES_MAX_BYTES = int(os.environ.get("RAW_UPDATES_MAX_BYTES", 50 * 1024 * 1024))
+
 MAX_TELEGRAM_TEXT = 3800
 
 BOT_API_COMPOSE_SERVICE = "telegram-bot-api"
@@ -67,7 +72,7 @@ def log(message):
     Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
     with LOG_LOCK:
         with open(LOG_FILE, "a") as f:
-            f.write(f"[pid {os.getpid()}] {message}\n")
+            f.write(f"[pid {os.getpid()}] {common.redact(message)}\n")
 
 
 # --- Telegram Bot API primitives -------------------------------------------------
@@ -78,11 +83,44 @@ def _api_base():
 
 
 def _allowed_user_ids():
-    return {
+    ids = {
         int(uid.strip())
         for uid in os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
         if uid.strip()
     }
+    if not ids:
+        raise RuntimeError(
+            "TELEGRAM_ALLOWED_USER_IDS is empty - refusing to start a listener that would "
+            "allowlist nobody and silently drop every message it ever receives"
+        )
+    return ids
+
+
+def _allowed_chat_ids():
+    """Optional second gate, on top of the per-sender allowlist. Empty means
+    an allowlisted sender may talk to the bot from any chat; set it to
+    restrict them to specific chats/groups (see SETUP.md)."""
+    return {
+        int(cid.strip())
+        for cid in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",")
+        if cid.strip()
+    }
+
+
+def _check_response(resp, endpoint):
+    """Validate a Bot API response without ever quoting the request URL.
+
+    `requests`' own `raise_for_status` puts the full URL - which carries the
+    bot token - into the exception message, and that message reaches log
+    files and plugin code. Everything here reports the endpoint name only.
+    """
+    if resp.status_code >= 400:
+        body = getattr(resp, "text", "") or ""
+        raise RuntimeError(f"{endpoint} failed: HTTP {resp.status_code} {body[:500]!r}")
+    result = resp.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"{endpoint} returned not-ok: {result}")
+    return result
 
 
 def get_updates(offset, api_base):
@@ -90,11 +128,7 @@ def get_updates(offset, api_base):
     if offset is not None:
         params["offset"] = offset
     resp = requests.get(f"{api_base}/getUpdates", params=params, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"getUpdates returned not-ok: {result}")
-    return result["result"]
+    return _check_response(resp, "getUpdates")["result"]
 
 
 def send_message(chat_id, text, api_base):
@@ -104,13 +138,31 @@ def send_message(chat_id, text, api_base):
             data={"chat_id": chat_id, "text": text[:4000] or "(empty response)"},
             timeout=30,
         )
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("ok"):
-            raise RuntimeError(f"sendMessage refused: {result}")
+        _check_response(resp, "sendMessage")
     except Exception:
         log(f"send_message FAILED for chat {chat_id}:\n{traceback.format_exc()}")
         raise
+
+
+def send_document(chat_id, path, api_base, caption=None):
+    """Send a local file to a chat. Uncapped in size beyond whatever the
+    self-hosted Bot API server itself allows - which is the reason this
+    package talks to one instead of api.telegram.org."""
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption[:1024]
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(
+                f"{api_base}/sendDocument", data=data,
+                files={"document": (os.path.basename(path), f)}, timeout=600,
+            )
+        result = _check_response(resp, "sendDocument")
+    except Exception:
+        log(f"send_document FAILED for chat {chat_id} path {path!r}:\n{traceback.format_exc()}")
+        raise
+    common.append_transcript("outgoing", chat_id, text=caption or None, file_path=path)
+    return result
 
 
 def send_stream_text(chat_id, text, api_base):
@@ -123,7 +175,7 @@ def send_stream_text(chat_id, text, api_base):
 def send_typing_action(chat_id, api_base):
     try:
         resp = requests.post(f"{api_base}/sendChatAction", data={"chat_id": chat_id, "action": "typing"}, timeout=10)
-        resp.raise_for_status()
+        _check_response(resp, "sendChatAction")
     except Exception as exc:
         log(f"sendChatAction (typing) failed for chat {chat_id}, continuing anyway: {exc!r}")
 
@@ -135,10 +187,7 @@ def set_message_reaction(chat_id, message_id, emoji, api_base):
             json={"chat_id": chat_id, "message_id": message_id, "reaction": [{"type": "emoji", "emoji": emoji}]},
             timeout=10,
         )
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("ok"):
-            log(f"setMessageReaction returned not-ok for chat {chat_id} message {message_id} emoji {emoji!r}: {result}")
+        _check_response(resp, "setMessageReaction")
     except Exception as exc:
         log(f"setMessageReaction failed for chat {chat_id} message {message_id} emoji {emoji!r}: {exc!r}")
 
@@ -149,10 +198,7 @@ def answer_callback_query(callback_query_id, api_base, text=None):
         if text:
             payload["text"] = text
         resp = requests.post(f"{api_base}/answerCallbackQuery", json=payload, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("ok"):
-            log(f"answerCallbackQuery returned not-ok for {callback_query_id}: {result}")
+        _check_response(resp, "answerCallbackQuery")
     except Exception as exc:
         log(f"answerCallbackQuery failed for {callback_query_id}: {exc!r}")
 
@@ -161,10 +207,7 @@ def register_bot_commands(api_base, plugin_commands):
     commands = BUILTIN_BOT_COMMANDS + plugin_commands
     try:
         resp = requests.post(f"{api_base}/setMyCommands", json={"commands": commands}, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("ok"):
-            log(f"setMyCommands returned not-ok: {result}")
+        _check_response(resp, "setMyCommands")
     except Exception as exc:
         log(f"setMyCommands failed, continuing anyway (bot will just have no command menu): {exc!r}")
 
@@ -173,18 +216,13 @@ def resolve_bot_identity(api_base):
     global BOT_ID, BOT_USERNAME
     try:
         resp = requests.post(f"{api_base}/getMe", timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("ok"):
-            me = result["result"]
-            BOT_ID = me.get("id")
-            BOT_USERNAME = me.get("username")
-            log(f"resolve_bot_identity: resolved bot id={BOT_ID} username={BOT_USERNAME!r}")
-        else:
-            log(f"getMe returned not-ok: {result}")
+        me = _check_response(resp, "getMe")["result"]
     except Exception:
         log(f"resolve_bot_identity FAILED - refusing to start:\n{traceback.format_exc()}")
         raise
+    BOT_ID = me.get("id")
+    BOT_USERNAME = me.get("username")
+    log(f"resolve_bot_identity: resolved bot id={BOT_ID} username={BOT_USERNAME!r}")
 
 
 # --- attachments -------------------------------------------------------------
@@ -252,11 +290,7 @@ def download_and_store_file(file_id, suggested_filename, api_base):
         return dest_path
 
     resp = requests.get(f"{api_base}/getFile", params={"file_id": file_id}, timeout=30)
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"getFile returned not-ok: {result}")
-    remote_path = result["result"]["file_path"]
+    remote_path = _check_response(resp, "getFile")["result"]["file_path"]
 
     tmp_path = f"{dest_path}.tmp"
     container = bot_api_container_name()
@@ -408,118 +442,175 @@ def save_state(state):
 
 
 def store_raw_update(update):
+    """Append one update to the raw-update log, rotating at
+    RAW_UPDATES_MAX_BYTES. Only ever called for updates that already passed
+    the allowlist - a stranger's message content is never written to disk.
+
+    A failure here is loud but never fatal: this log is a debugging aid, and
+    a full disk or a bad permission on it must not take the listener down
+    for every user it is currently serving.
+    """
     try:
         Path(RAW_UPDATES_LOG).parent.mkdir(parents=True, exist_ok=True)
+        if os.path.exists(RAW_UPDATES_LOG) and os.path.getsize(RAW_UPDATES_LOG) >= RAW_UPDATES_MAX_BYTES:
+            os.replace(RAW_UPDATES_LOG, f"{RAW_UPDATES_LOG}.1")
         with open(RAW_UPDATES_LOG, "a") as f:
             f.write(json.dumps(update) + "\n")
     except Exception:
-        log(f"store_raw_update FAILED for update {update.get('update_id')}:\n{traceback.format_exc()}")
-        raise
+        log(f"store_raw_update FAILED for update {update.get('update_id')}, continuing:\n{traceback.format_exc()}")
 
 
 # --- per-chat batching ---------------------------------------------------------
 
 class ChatBatcher:
-    """Collapses a burst of messages from one chat into a single dispatched turn."""
+    """Collapses a burst of messages from one chat into a single dispatched turn.
 
-    _managers = {}
-    _managers_guard = threading.Lock()
+    Sender identity travels with each queued message rather than being
+    bound once when the batcher is created: in a group chat, consecutive
+    turns come from different people, and a batcher lives for the whole
+    process.
+    """
 
     def __init__(self, chat_id, dispatch):
         self.chat_id = chat_id
         self.dispatch = dispatch
         self.inbox = []
         self.batch_started_at = 0.0
-        self.flush_task = None
+        self.timer_task = None
+        self.dispatch_tasks = set()
 
-    @classmethod
-    def get(cls, chat_id, dispatch):
-        with cls._managers_guard:
-            mgr = cls._managers.get(chat_id)
-            if mgr is None:
-                mgr = cls(chat_id, dispatch)
-                cls._managers[chat_id] = mgr
-            return mgr
-
-    async def queue(self, message_id, turn_text):
+    async def queue(self, message_id, turn_text, sender_name, sender_id):
         if not self.inbox:
             self.batch_started_at = time.time()
-        self.inbox.append((message_id, turn_text))
+        self.inbox.append((message_id, turn_text, sender_name, sender_id))
         if len(self.inbox) >= MESSAGE_BATCH_MAX_MESSAGES:
             log(f"chat {self.chat_id}: batch hit {MESSAGE_BATCH_MAX_MESSAGES} messages, delivering without waiting out the quiet period")
-            await self.flush()
+            self._cancel_timer()
+            self.flush()
             return
-        self._reschedule_flush()
+        self._restart_timer()
 
-    def _reschedule_flush(self):
-        if self.flush_task is not None and not self.flush_task.done():
-            self.flush_task.cancel()
-        self.flush_task = asyncio.create_task(self._flush_when_quiet())
+    def _cancel_timer(self):
+        if self.timer_task is not None and not self.timer_task.done():
+            self.timer_task.cancel()
+        self.timer_task = None
+
+    def _restart_timer(self):
+        self._cancel_timer()
+        self.timer_task = asyncio.create_task(self._flush_when_quiet())
 
     async def _flush_when_quiet(self):
-        try:
-            delay = MESSAGE_BATCH_QUIET_SECONDS
-            if self.batch_started_at:
-                delay = min(delay, max(0.0, self.batch_started_at + MESSAGE_BATCH_MAX_WAIT_SECONDS - time.time()))
-            await asyncio.sleep(delay)
-            await self.flush()
-        except asyncio.CancelledError:
-            raise
+        delay = MESSAGE_BATCH_QUIET_SECONDS
+        if self.batch_started_at:
+            delay = min(delay, max(0.0, self.batch_started_at + MESSAGE_BATCH_MAX_WAIT_SECONDS - time.time()))
+        await asyncio.sleep(delay)
+        self.timer_task = None
+        self.flush()
 
-    async def flush(self):
+    def flush(self):
+        """Hand the current batch to the dispatch layer, in a task of its own.
+
+        Deliberately not awaited from the quiet-period timer: a later
+        message restarts that timer, which cancels it, and a dispatch
+        running inside it would be cancelled along with it - killing a turn
+        already in flight halfway through, leaving the plugin's own
+        per-chat state wherever the exception landed.
+        """
         batch, self.inbox = self.inbox, []
         self.batch_started_at = 0.0
         if not batch:
             return
-        message_ids = [mid for mid, _ in batch]
-        text = combine_turns([t for _, t in batch])
+        task = asyncio.create_task(self._dispatch_batch(batch))
+        # Hold a reference until it finishes; asyncio only weakly
+        # references running tasks and will otherwise collect one mid-turn.
+        self.dispatch_tasks.add(task)
+        task.add_done_callback(self.dispatch_tasks.discard)
+
+    async def _dispatch_batch(self, batch):
+        message_ids = [mid for mid, _, _, _ in batch]
+        text = combine_turns([t for _, t, _, _ in batch])
+        # The most recent message in the batch is the one being replied to,
+        # so its sender is the turn's sender.
+        _, _, sender_name, sender_id = batch[-1]
         log(f"chat {self.chat_id}: delivering {len(batch)} message(s) as one turn")
-        await self.dispatch(message_ids, text)
-
-
-# --- update handling -----------------------------------------------------------
-
-_CHAT_LOCKS = {}
-
-
-def _get_chat_lock(chat_id):
-    lock = _CHAT_LOCKS.get(chat_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _CHAT_LOCKS[chat_id] = lock
-    return lock
+        try:
+            await self.dispatch(self.chat_id, message_ids, text, sender_name, sender_id)
+        except Exception:
+            log(f"chat {self.chat_id}: dispatch failed:\n{traceback.format_exc()}")
 
 
 class Listener:
-    def __init__(self, plugin, api_base=None, allowed_user_ids=None):
+    def __init__(self, plugin, api_base=None, allowed_user_ids=None, allowed_chat_ids=None):
         self.plugin = plugin
         self.api_base = api_base or _api_base()
         self.allowed_user_ids = allowed_user_ids if allowed_user_ids is not None else _allowed_user_ids()
+        self.allowed_chat_ids = allowed_chat_ids if allowed_chat_ids is not None else _allowed_chat_ids()
+        self._batchers = {}
+        self._chat_locks = {}
+        self._turn_locks = {}
 
     def _api(self):
+        # Every send primitive is handed over as a coroutine function: the
+        # underlying calls are blocking `requests` calls, and running one
+        # inline on the event loop would stall the poll loop and every
+        # other chat for its full duration.
         return ListenerAPI(
-            send_message=lambda chat_id, text: send_stream_text(chat_id, text, self.api_base),
-            send_typing=lambda chat_id: send_typing_action(chat_id, self.api_base),
-            set_reaction=lambda chat_id, message_id, emoji: set_message_reaction(chat_id, message_id, emoji, self.api_base),
+            send_message=lambda chat_id, text: asyncio.to_thread(send_stream_text, chat_id, text, self.api_base),
+            send_typing=lambda chat_id: asyncio.to_thread(send_typing_action, chat_id, self.api_base),
+            set_reaction=lambda chat_id, message_id, emoji: asyncio.to_thread(
+                set_message_reaction, chat_id, message_id, emoji, self.api_base),
+            send_document=lambda chat_id, path, caption=None: asyncio.to_thread(
+                send_document, chat_id, path, self.api_base, caption),
             log=log,
         )
 
-    async def _dispatch_turn(self, chat_id, sender_name, sender_id, message_ids, text):
-        turn = Turn(chat_id=chat_id, message_ids=message_ids, text=text, sender_name=sender_name, sender_id=sender_id)
-        try:
-            await self.plugin.handle_turn(turn, self._api())
-        except Exception:
-            log(f"chat {chat_id}: plugin.handle_turn failed:\n{traceback.format_exc()}")
-            for message_id in message_ids:
-                await asyncio.to_thread(set_message_reaction, chat_id, message_id, "\U0001F44E", self.api_base)
-            return
-        for message_id in message_ids:
-            await asyncio.to_thread(set_message_reaction, chat_id, message_id, "\U0001F44D", self.api_base)
+    def _batcher(self, chat_id):
+        batcher = self._batchers.get(chat_id)
+        if batcher is None:
+            batcher = ChatBatcher(chat_id, self._dispatch_turn)
+            self._batchers[chat_id] = batcher
+        return batcher
 
-    def _make_dispatch(self, chat_id, sender_name, sender_id):
-        async def dispatch(message_ids, text):
-            await self._dispatch_turn(chat_id, sender_name, sender_id, message_ids, text)
-        return dispatch
+    def _chat_lock(self, chat_id):
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
+        return lock
+
+    def _turn_lock(self, chat_id):
+        lock = self._turn_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._turn_locks[chat_id] = lock
+        return lock
+
+    def _allowed(self, sender_id, chat_id):
+        """The complete access-control gate: an allowlisted sender, and - if
+        TELEGRAM_ALLOWED_CHAT_IDS is set - an allowlisted chat. Returns
+        (allowed, reason-if-not)."""
+        if sender_id not in self.allowed_user_ids:
+            return False, f"disallowed user id {sender_id}"
+        if self.allowed_chat_ids and chat_id not in self.allowed_chat_ids:
+            return False, f"allowlisted user {sender_id} but disallowed chat id {chat_id}"
+        return True, ""
+
+    async def _dispatch_turn(self, chat_id, message_ids, text, sender_name, sender_id):
+        # One turn at a time per chat. A plugin holds per-chat state (an
+        # agent session, a subprocess) that concurrent turns would corrupt,
+        # and a turn can outlast the next batch's quiet period.
+        async with self._turn_lock(chat_id):
+            turn = Turn(chat_id=chat_id, message_ids=message_ids, text=text,
+                        sender_name=sender_name, sender_id=sender_id)
+            try:
+                await self.plugin.handle_turn(turn, self._api())
+            except Exception:
+                log(f"chat {chat_id}: plugin.handle_turn failed:\n{traceback.format_exc()}")
+                reaction = "\U0001F44E"
+            else:
+                reaction = "\U0001F44D"
+            for message_id in message_ids:
+                await asyncio.to_thread(set_message_reaction, chat_id, message_id, reaction, self.api_base)
 
     def handle_callback_query(self, callback_query):
         query_id = callback_query["id"]
@@ -530,8 +621,9 @@ class Listener:
         chat_id = (message.get("chat") or {}).get("id")
         message_id = message.get("message_id")
 
-        if sender_id not in self.allowed_user_ids:
-            log(f"DROPPED callback_query: from disallowed user id {sender_id}, data={data!r}")
+        allowed, reason = self._allowed(sender_id, chat_id)
+        if not allowed:
+            log(f"DROPPED callback_query: {reason}, data={data!r}")
             answer_callback_query(query_id, self.api_base, text="Not authorized.")
             return
 
@@ -551,8 +643,9 @@ class Listener:
         message_id = message["message_id"]
         sender_name = sender.get("first_name") or sender.get("username") or str(sender_id)
 
-        if sender_id not in self.allowed_user_ids:
-            log(f"DROPPED: message from disallowed user id {sender_id} ({sender_name!r}, chat {chat_id})")
+        allowed, reason = self._allowed(sender_id, chat_id)
+        if not allowed:
+            log(f"DROPPED: message from {reason} ({sender_name!r}, chat {chat_id})")
             return
 
         text = message.get("text") or message.get("caption") or ""
@@ -593,9 +686,8 @@ class Listener:
         common.append_transcript("incoming", chat_id, text=text or None, file_path=attachment_path or None, sender_name=sender_name, sender_id=sender_id)
 
         turn_text = build_turn_text(sender_name, sender_id, message, text, attachment_kind, attachment_path)
-        batcher = ChatBatcher.get(chat_id, self._make_dispatch(chat_id, sender_name, sender_id))
         log(f"ALLOWED: queued for chat {chat_id} - sender={sender_name} ({sender_id}) text={text!r} attachment={attachment_kind or 'none'}")
-        await batcher.queue(message_id, turn_text)
+        await self._batcher(chat_id).queue(message_id, turn_text, sender_name, sender_id)
 
     async def handle_update(self, update):
         callback_query = update.get("callback_query")
@@ -603,13 +695,31 @@ class Listener:
             await asyncio.to_thread(self.handle_callback_query, callback_query)
             return
 
-        message = update.get("message") or update.get("edited_message")
+        if update.get("edited_message") and not update.get("message"):
+            # An edit is not a new turn. Re-running the agent because
+            # somebody fixed a typo means paying for, and acting on, the
+            # same message twice.
+            log(f"update {update['update_id']}: edited message, not re-running the turn")
+            return
+
+        message = update.get("message")
         if not message:
             log(f"update {update['update_id']}: no message/edited_message/callback_query field, skipping")
             return
 
+        sender_id = (message.get("from") or {}).get("id")
         chat_id = message["chat"]["id"]
-        async with _get_chat_lock(chat_id):
+        allowed, reason = self._allowed(sender_id, chat_id)
+        if not allowed:
+            # Gate before anything is written to disk or any per-chat state
+            # is allocated, so an unauthorized sender can neither get their
+            # message content persisted nor grow this process's memory.
+            log(f"DROPPED update {update['update_id']}: {reason}")
+            return
+
+        await asyncio.to_thread(store_raw_update, update)
+
+        async with self._chat_lock(chat_id):
             await self.handle_message(message)
 
     async def _handle_update_safe(self, update):
@@ -637,13 +747,15 @@ class Listener:
 
             for update in updates:
                 offset = update["update_id"] + 1
-                await asyncio.to_thread(store_raw_update, update)
                 save_state({"last_update_id": update["update_id"]})
                 asyncio.create_task(self._handle_update_safe(update))
 
 
 def main():
     plugin = load_plugin()
+    # Construct the listener before the poll loop starts, so a missing token
+    # or an empty allowlist fails immediately and visibly rather than after
+    # the service reports itself active.
     listener = Listener(plugin)
     try:
         asyncio.run(listener.run())

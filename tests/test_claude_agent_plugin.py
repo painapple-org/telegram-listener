@@ -1,15 +1,36 @@
 import asyncio
 
-from plugins.claude_agent import ClaudeAgentPlugin
+import pytest
+
 from telegram_listener.plugin import ListenerAPI, Turn
-from tests.fakes import FakeClaudeSDKClient
+
+# The example plugin - and only the example plugin - needs the optional
+# `claude-agent-plugin` extra. Skip rather than error when it isn't
+# installed, so `uv run pytest` on core dependencies alone still passes.
+pytest.importorskip("claude_agent_sdk", reason="optional claude-agent-plugin extra not installed")
+
+from plugins.claude_agent import ClaudeAgentPlugin  # noqa: E402
+from tests.plugin_fakes import FakeClaudeSDKClient  # noqa: E402
 
 
 def make_api(sent, reactions):
+    async def send_message(chat_id, text):
+        sent.append((chat_id, text))
+
+    async def send_typing(chat_id):
+        pass
+
+    async def set_reaction(chat_id, message_id, emoji):
+        reactions.append((chat_id, message_id, emoji))
+
+    async def send_document(chat_id, path, caption=None):
+        sent.append((chat_id, path, caption))
+
     return ListenerAPI(
-        send_message=lambda chat_id, text: sent.append((chat_id, text)),
-        send_typing=lambda chat_id: None,
-        set_reaction=lambda chat_id, message_id, emoji: reactions.append((chat_id, message_id, emoji)),
+        send_message=send_message,
+        send_typing=send_typing,
+        set_reaction=set_reaction,
+        send_document=send_document,
         log=lambda message: None,
     )
 
