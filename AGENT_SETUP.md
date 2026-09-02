@@ -105,10 +105,13 @@ the IDs in `TELEGRAM_ALLOWED_USER_IDS`), and check it landed:
 tail -n 5 <path-to-this-repo>/data/telegram-listener/transcript.jsonl
 ```
 
-A new line with `"direction": "in"` matching what they sent means the
-listener received and logged it. If the plugin you wired up in section 3
-also replies, you should see a corresponding `"direction": "out"` line and
-the reply should arrive in the chat.
+A new line with `"direction": "incoming"` matching what they sent means the
+listener received and logged it (see `telegram_listener/common.py`'s
+`append_transcript` — this is the only direction it ever writes; outgoing
+replies go straight to Telegram via `ListenerAPI.send_message` and are
+never appended to this file). If the plugin you wired up in section 3 also
+replies, confirm that by watching for the reply to actually arrive in the
+chat, not by looking for a further transcript line.
 
 ### Troubleshooting
 
