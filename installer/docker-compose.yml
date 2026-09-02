@@ -1,0 +1,19 @@
+# The self-hosted local Bot API server this listener talks to
+# (TELEGRAM_BOT_TOKEN's base URL, resolved by
+# telegram_listener.common.resolve_bot_api_base). It never spawns a plugin
+# session or touches git/uv - it's a stateless local HTTP proxy in front of
+# api.telegram.org, with a local file-serving quirk for large files - so
+# unlike the listener process itself (see install.sh, a systemd --user
+# unit), it stays a plain Docker Compose service.
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_LOCAL=1
+    volumes:
+      - ./data/telegram-bot-api:/var/lib/telegram-bot-api
