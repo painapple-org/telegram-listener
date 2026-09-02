@@ -60,6 +60,12 @@ uv run python -m telegram_listener.listener
 For a persistent host install (systemd `--user` unit + linger), see
 `installer/install.sh`.
 
+For an AI agent installing this package and wiring it into an agent
+framework on a human's behalf, see `AGENT_SETUP.md` instead of this
+section — it covers the same ground plus credential gathering and plugin
+wiring, written for an agent to read and act on rather than for a human to
+follow by hand.
+
 ## Testing
 
 ```
