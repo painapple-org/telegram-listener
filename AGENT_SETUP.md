@@ -255,9 +255,10 @@ Concretely, it:
 Every one of those is a fact about running an agent with a bounded context
 window, not a fact about Telegram — which is exactly why they live in the
 plugin and not in the listener core. The hooks they hang off (`on_start`,
-`interrupt_turn`, `live_context`) are all optional: a plugin that defines
-none of them still works, it just waits turns out instead of interrupting
-them and owns no background work.
+`interrupt_turn`, `live_context`, `build_turn_text`) are all optional: a
+plugin that defines none of them still works, it just waits turns out
+instead of interrupting them, owns no background work, and takes the
+listener's own turn layout.
 
 If you're wiring this repo into another agent framework, this plugin is
 usually the right starting point to copy and adapt rather than writing a

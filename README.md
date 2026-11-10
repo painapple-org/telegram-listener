@@ -87,6 +87,46 @@ plain text in `Turn.text` rather than having to re-derive it:
 - **Reactions.** An incoming message is acknowledged the moment it is
   queued, and marked done or failed when its turn ends. Inbound reaction
   updates from other people are recorded into the transcript.
+- **Edits.** An edit produces a turn, marked as an edit. An edit is
+  usually a correction, and ignoring one means answering text the person
+  has already replaced. An edit of a message still waiting out the quiet
+  period replaces it in the batch rather than being delivered alongside
+  it.
+- **Out-of-band sends.** See below.
+
+## Messages your plugin didn't send
+
+Anything else on the host can send into the same chat — a cron alert, a
+deploy notification, another session. The person sees one conversation;
+without help the plugin sees only its own half of it, and answers "what
+did you just say" with the last thing *it* said rather than the message
+they are looking at.
+
+So: messages sent into a chat since its last turn that the listener did
+not send itself are included in the next turn as their own labelled
+block, with whatever each sender called itself. They never trigger a turn
+of their own — an alert stays silent until the person next says
+something, and is then simply part of that turn's context.
+
+"Not mine" is answered structurally rather than guessed at. The
+listener's own send primitives mark their transcript entries
+`from_listener`; everything else in the transcript is out-of-band by
+construction. A sender that forgets to identify itself is still reported,
+just unattributed — the failure direction that matters is a message the
+plugin never hears about at all.
+
+To send into a chat from outside the listener and have it show up this
+way, record it:
+
+```python
+from telegram_listener import common
+
+common.append_transcript("outgoing", chat_id, text=body, sent_by="deploy-notify")
+```
+
+`sent_by` is what the plugin will see, so name the thing a person would
+recognize. Omitting the call entirely means the message reaches the chat
+and the plugin never learns it happened.
 
 ## Writing your own plugin
 
@@ -102,10 +142,12 @@ class DispatchPlugin(Protocol):
 ```
 
 and the optional ones — `on_start` (background work of the plugin's own,
-e.g. a watchdog), `live_context` (fresh out-of-band state the listener
-folds into the next turn, on its own refresh interval), and
-`interrupt_turn` (abort a turn that has overrun while a new message
-waits).
+e.g. a watchdog), `live_context` (fresh host state the listener folds
+into the next turn, on its own refresh interval), `build_turn_text` (own
+the turn body's layout, e.g. from a prompt template of your own, with the
+listener's already-rendered `extras` handed to you so nothing has to be
+re-derived), and `interrupt_turn` (abort a turn that has overrun while a
+new message waits).
 
 Point `DISPATCH_PLUGIN` at `module.path:factory_function`, where
 `factory_function()` returns an instance of your plugin. See
