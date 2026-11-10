@@ -56,3 +56,37 @@ class TestReactionEmoji:
 
     def test_an_emoji_telegram_does_not_accept_is_rejected(self):
         assert common.canonical_reaction_emoji("\U0001F9C0") is None
+
+
+class TestOutOfBandMarking:
+    def test_the_listeners_own_sends_are_marked(self):
+        common.append_transcript("outgoing", 100, text="mine", from_listener=True)
+        assert common.read_transcript()[-1]["from_listener"] is True
+
+    def test_an_unmarked_send_is_not_claimed_by_the_listener(self):
+        """Absence of the mark is what makes a send out-of-band, so a
+        caller that forgets to identify itself errs toward being seen."""
+        common.append_transcript("outgoing", 100, text="theirs", sent_by="cron")
+        entry = common.read_transcript()[-1]
+        assert "from_listener" not in entry
+        assert entry["sent_by"] == "cron"
+
+
+class TestTranscriptCursor:
+    def test_only_entries_after_the_cursor_come_back(self):
+        common.append_transcript("outgoing", 100, text="first")
+        fresh, index = common.read_transcript_since(0)
+        assert [e["text"] for e in fresh] == ["first"]
+
+        common.append_transcript("outgoing", 100, text="second")
+        fresh, _ = common.read_transcript_since(index)
+        assert [e["text"] for e in fresh] == ["second"]
+
+    def test_the_returned_index_counts_every_chat_not_the_filtered_ones(self):
+        """Counting only the matching entries would let a second chat's
+        traffic silently shift this chat's cursor past unread messages."""
+        common.append_transcript("outgoing", 100, text="mine")
+        common.append_transcript("outgoing", 999, text="someone else's")
+        fresh, index = common.read_transcript_since(0, chat_id=100)
+        assert [e["text"] for e in fresh] == ["mine"]
+        assert index == 2

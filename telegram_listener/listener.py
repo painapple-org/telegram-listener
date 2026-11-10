@@ -28,7 +28,7 @@ from pathlib import Path
 import requests
 
 from telegram_listener import common
-from telegram_listener.plugin import ListenerAPI, Turn, load_plugin
+from telegram_listener.plugin import ListenerAPI, Turn, TurnTextParts, load_plugin
 
 DATA_DIR = common.resolve_data_dir()
 
@@ -36,6 +36,9 @@ STATE_FILE = os.path.join(DATA_DIR, "telegram-listener", "state.json")
 RAW_UPDATES_LOG = os.path.join(DATA_DIR, "telegram-listener", "raw_updates.jsonl")
 FILES_DIR = os.path.join(DATA_DIR, "telegram-listener", "files")
 LOG_FILE = os.path.join(DATA_DIR, "telegram-listener", "listener.log")
+# How far through the transcript each chat has been told about. See
+# `Listener._out_of_band_block`.
+OUT_OF_BAND_CURSOR_FILE = os.path.join(DATA_DIR, "telegram-listener", "out_of_band_cursor.json")
 
 MESSAGE_BATCH_QUIET_SECONDS = int(os.environ.get("MESSAGE_BATCH_QUIET_SECONDS", 8))
 MESSAGE_BATCH_MAX_WAIT_SECONDS = int(os.environ.get("MESSAGE_BATCH_MAX_WAIT_SECONDS", 120))
@@ -184,7 +187,7 @@ def send_message(chat_id, text, api_base, reply_to_message_id=None, disable_noti
         log(f"send_message FAILED for chat {chat_id}:\n{traceback.format_exc()}")
         raise
     message_id = (result.get("result") or {}).get("message_id")
-    common.append_transcript("outgoing", chat_id, text=text, message_id=message_id)
+    common.append_transcript("outgoing", chat_id, text=text, message_id=message_id, from_listener=True)
     return message_id
 
 
@@ -207,7 +210,7 @@ def edit_message(chat_id, message_id, text, api_base):
             return True
         log(f"editMessageText refused for chat {chat_id} message {message_id}: {description or resp.status_code}")
         return False
-    common.append_transcript("outgoing", chat_id, text=text, message_id=message_id)
+    common.append_transcript("outgoing", chat_id, text=text, message_id=message_id, from_listener=True)
     return True
 
 
@@ -244,7 +247,7 @@ def send_document(chat_id, path, api_base, caption=None, reply_to_message_id=Non
         raise
     common.append_transcript(
         "outgoing", chat_id, text=caption or None, file_path=path,
-        message_id=(result.get("result") or {}).get("message_id"),
+        message_id=(result.get("result") or {}).get("message_id"), from_listener=True,
     )
     return result
 
@@ -432,7 +435,7 @@ def send_voice_message(chat_id, text, api_base, reply_to_message_id=None):
             result = _check_response(resp, "sendVoice")
             common.append_transcript(
                 "outgoing", chat_id, text="[voice message]",
-                message_id=(result.get("result") or {}).get("message_id"),
+                message_id=(result.get("result") or {}).get("message_id"), from_listener=True,
             )
             return True
         except Exception as exc:
@@ -788,7 +791,12 @@ def describe_message_provenance(message):
         lines.append(f"This message is a FORWARD, not the sender's own words - it originally came from {source}{when}.")
 
     if message.get("edit_date"):
-        lines.append(f"This is an edited version of an earlier message (edited {_format_timestamp(message['edit_date'])}).")
+        lines.append(
+            f"This is an EDITED version of a message you have already been shown (edited "
+            f"{_format_timestamp(message['edit_date'])}). The text above replaces what it said "
+            f"before. Treat it as a correction: redo only what the change actually invalidates, "
+            f"and don't repeat work you already did on the earlier version."
+        )
 
     via_bot = message.get("via_bot")
     if via_bot:
@@ -822,8 +830,29 @@ def _is_reply_to_bot(message):
     return (reply_to.get("from") or {}).get("id") == BOT_ID
 
 
-def build_turn_text(sender_name, sender_id, message, text, attachment_kind, attachment_path,
-                    is_known_command=False, live_context="", in_flight=""):
+def describe_out_of_band(entries):
+    """Messages that arrived in this chat from outside the agent's own
+    session - a cron alert, a notification script, another session on the
+    host - since the last turn.
+
+    The person in the chat sees one conversation; without this the session
+    sees only its own half of it, and answers "what did you just say" with
+    the last thing *it* said rather than the message they are looking at.
+    """
+    if not entries:
+        return ""
+    lines = []
+    for entry in entries:
+        who = entry.get("sent_by") or "an unidentified process (it did not name itself)"
+        body = entry.get("text") or ""
+        if entry.get("file"):
+            body = f"{body} [file: {entry['file']}]".strip()
+        lines.append(f"- {entry.get('timestamp')}, sent by {who}: {body or '(no text)'}")
+    return "\n".join(lines)
+
+
+def turn_extras(message, attachment_kind, attachment_path,
+                is_known_command=False, live_context="", in_flight="", out_of_band=""):
     extras = []
 
     hints = []
@@ -855,8 +884,21 @@ def build_turn_text(sender_name, sender_id, message, text, attachment_kind, atta
             "or require coordinating with them):\n" + in_flight
         )
 
-    body = f"Message from {sender_name} (id {sender_id}):\n{text or '(no text)'}"
-    return body + ("\n\n" + "\n\n".join(extras) if extras else "")
+    if out_of_band:
+        extras.append(
+            "Sent into this chat since your last turn by something other than you - these are "
+            "already on screen for the person you are talking to, and you did not say them:\n"
+            + out_of_band
+        )
+
+    return "\n\n".join(extras)
+
+
+def default_turn_text(parts):
+    """The listener's own turn layout, used unless a plugin's
+    `build_turn_text` hook replaces it."""
+    body = f"Message from {parts.sender_name} (id {parts.sender_id}):\n{parts.text or '(no text)'}"
+    return body + (f"\n\n{parts.extras}" if parts.extras else "")
 
 
 def combine_turns(turn_texts):
@@ -893,6 +935,25 @@ def save_state(state):
     with open(tmp_file, "w") as f:
         json.dump(state, f)
     os.replace(tmp_file, STATE_FILE)
+
+
+def load_out_of_band_cursor():
+    if not os.path.exists(OUT_OF_BAND_CURSOR_FILE):
+        return {}
+    try:
+        with open(OUT_OF_BAND_CURSOR_FILE) as f:
+            return {int(chat_id): index for chat_id, index in json.load(f).items()}
+    except Exception as exc:
+        log(f"out-of-band cursor unreadable ({exc!r}), starting as if every chat is caught up")
+        return {}
+
+
+def save_out_of_band_cursor(cursor):
+    Path(OUT_OF_BAND_CURSOR_FILE).parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = f"{OUT_OF_BAND_CURSOR_FILE}.tmp"
+    with open(tmp_file, "w") as f:
+        json.dump({str(chat_id): index for chat_id, index in cursor.items()}, f)
+    os.replace(tmp_file, OUT_OF_BAND_CURSOR_FILE)
 
 
 def store_raw_update(update):
@@ -988,7 +1049,18 @@ class ChatBatcher:
     async def queue(self, message_id, turn_text, sender_name, sender_id):
         if not self.inbox:
             self.batch_started_at = time.time()
-        self.inbox.append((message_id, turn_text, sender_name, sender_id))
+        queued = (message_id, turn_text, sender_name, sender_id)
+        for index, (existing_id, _, _, _) in enumerate(self.inbox):
+            if existing_id == message_id:
+                # An edit of a message still waiting out the quiet period.
+                # Appending would put both versions of the same message in
+                # one turn and react to it twice; the newer text is simply
+                # what that message now says.
+                log(f"chat {self.chat_id}: message {message_id} was edited before it was delivered, replacing it in the batch")
+                self.inbox[index] = queued
+                self._restart_timer()
+                return
+        self.inbox.append(queued)
         if len(self.inbox) >= MESSAGE_BATCH_MAX_MESSAGES and not self.sleeping():
             log(f"chat {self.chat_id}: batch hit {MESSAGE_BATCH_MAX_MESSAGES} messages, delivering without waiting out the quiet period")
             self._cancel_timer()
@@ -1091,6 +1163,11 @@ class Listener:
         self._turn_locks = {}
         self._turn_started_at = {}
         self._last_live_context = {}
+        # Per chat, how far through the transcript this chat's session has
+        # already been shown. Persisted, because after a restart the
+        # listener would otherwise either re-read a chat its whole history
+        # or skip whatever arrived while it was down.
+        self._out_of_band_cursor = load_out_of_band_cursor()
 
     def builtin_commands(self):
         commands = [
@@ -1172,6 +1249,50 @@ class Listener:
             if chat_id != current_chat_id
         ]
         return "\n".join(lines)
+
+    def _out_of_band_block(self, chat_id):
+        """Everything sent into this chat since the last turn that the
+        listener did not send itself.
+
+        "Not mine" is answered structurally, not guessed at: the listener's
+        own send primitives mark their transcript entries `from_listener`,
+        so the complement is exactly what came from somewhere else. A
+        sender that identifies itself is named; one that doesn't is still
+        reported, since the failure direction that matters is a message the
+        agent never hears about at all.
+        """
+        start = self._out_of_band_cursor.get(chat_id)
+        if start is None:
+            # First turn this chat has ever had a cursor for. "Since your
+            # last turn" has no meaning yet, and starting at zero would
+            # dump every message ever sent to this chat into one turn.
+            _, start = common.read_transcript_since(0)
+        entries, next_index = common.read_transcript_since(start, chat_id=chat_id)
+        # Store even when nothing moved: a chat whose cursor is never
+        # written keeps re-deriving "caught up" from the current end of the
+        # transcript, which skips everything that arrives before its next
+        # turn instead of reporting it.
+        if self._out_of_band_cursor.get(chat_id) != next_index:
+            self._out_of_band_cursor[chat_id] = next_index
+            try:
+                save_out_of_band_cursor(self._out_of_band_cursor)
+            except Exception as exc:
+                log(f"chat {chat_id}: saving the out-of-band cursor failed, it will be re-read next turn: {exc!r}")
+        out_of_band = [
+            entry for entry in entries
+            if entry.get("direction") == "outgoing" and not entry.get("from_listener")
+        ]
+        return describe_out_of_band(out_of_band)
+
+    async def _build_turn_text(self, parts):
+        hook = getattr(self.plugin, "build_turn_text", None)
+        if hook is None:
+            return default_turn_text(parts)
+        try:
+            return await hook(parts)
+        except Exception:
+            log(f"chat {parts.chat_id}: plugin.build_turn_text failed, falling back to the default layout:\n{traceback.format_exc()}")
+            return default_turn_text(parts)
 
     async def _live_context(self, chat_id):
         hook = getattr(self.plugin, "live_context", None)
@@ -1412,12 +1533,18 @@ class Listener:
             set_message_reaction, chat_id, message_id,
             REACTION_SLEEPING if batcher.sleeping() else REACTION_RECEIVED, self.api_base)
 
-        turn_text = build_turn_text(
-            sender_name, sender_id, message, text, attachment_kind, attachment_path,
-            is_known_command=is_known_command,
-            live_context=await self._live_context(chat_id),
-            in_flight=self.render_in_flight_chats(chat_id),
+        parts = TurnTextParts(
+            chat_id=chat_id, message_id=message_id, sender_name=sender_name, sender_id=sender_id,
+            message=message, text=text,
+            extras=turn_extras(
+                message, attachment_kind, attachment_path,
+                is_known_command=is_known_command,
+                live_context=await self._live_context(chat_id),
+                in_flight=self.render_in_flight_chats(chat_id),
+                out_of_band=self._out_of_band_block(chat_id),
+            ),
         )
+        turn_text = await self._build_turn_text(parts)
         log(f"ALLOWED: queued for chat {chat_id} - sender={sender_name} ({sender_id}) text={text!r} attachment={attachment_kind or 'none'}")
         await batcher.queue(message_id, turn_text, sender_name, sender_id)
 
@@ -1438,14 +1565,14 @@ class Listener:
             await asyncio.to_thread(self.handle_callback_query, callback_query)
             return
 
-        if update.get("edited_message") and not update.get("message"):
-            # An edit is not a new turn. Re-running the agent because
-            # somebody fixed a typo means paying for, and acting on, the
-            # same message twice.
-            log(f"update {update['update_id']}: edited message, not re-running the turn")
-            return
-
-        message = update.get("message")
+        # An edit is usually a correction, and ignoring it means acting on
+        # text the person has already replaced. It does produce a turn,
+        # therefore - marked as an edit in the provenance, so the agent
+        # knows it has seen an earlier version and need not redo work the
+        # change doesn't invalidate. The duplicate-turn hazard that made
+        # this a skip is handled where it actually arises: `ChatBatcher.queue`
+        # replaces a still-queued message instead of delivering both.
+        message = update.get("message") or update.get("edited_message")
         if not message:
             log(f"update {update['update_id']}: no message/edited_message/callback_query field, skipping")
             return

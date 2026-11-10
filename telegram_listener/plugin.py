@@ -39,6 +39,29 @@ class Turn:
 
 
 @dataclass
+class TurnTextParts:
+    """Everything the listener worked out about one message, handed to a
+    plugin's optional `build_turn_text` hook so it can assemble the turn
+    body itself (from a prompt template of its own, say) instead of taking
+    the listener's default layout.
+
+    `message` is the raw Telegram message dict, for anything the listener
+    did not think to pull out. `extras` is the already-rendered block of
+    addressing signals, attachment paths, provenance, live state and
+    out-of-band sends - a plugin that only wants a different wrapper around
+    the same information drops this in rather than re-deriving any of it.
+    """
+
+    chat_id: int
+    message_id: int
+    sender_name: str
+    sender_id: Optional[int]
+    message: dict
+    text: str
+    extras: str
+
+
+@dataclass
 class ListenerAPI:
     """What a plugin is given to act with - the listener's own send/react/log
     primitives, so a plugin never talks to the Telegram Bot API directly.
@@ -121,6 +144,13 @@ class DispatchPlugin(Protocol):
         LIVE_CONTEXT_REFRESH_INTERVAL_SECONDS per chat - so a plugin never
         has to own that cadence, and the data source stays entirely the
         plugin's business."""
+        ...
+
+    async def build_turn_text(self, parts: TurnTextParts) -> str:
+        """Assemble the turn body for one message. Without this hook the
+        listener uses its own layout (`listener.default_turn_text`), which
+        is also the right thing to fall back to inside an implementation
+        that only wants to wrap it."""
         ...
 
     async def interrupt_turn(self, chat_id: int, api: ListenerAPI) -> str:

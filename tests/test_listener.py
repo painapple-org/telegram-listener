@@ -106,7 +106,9 @@ class TestRawUpdateLog:
 
 
 class TestEditedMessages:
-    def test_an_edit_does_not_rerun_the_turn(self, monkeypatch):
+    def test_an_edit_produces_a_turn(self, monkeypatch):
+        """Ignoring an edit means answering text the person has already
+        replaced."""
         monkeypatch.setattr(listener, "requests", FakeRequests())
         monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
         plugin = RecordingPlugin()
@@ -118,7 +120,34 @@ class TestEditedMessages:
             await asyncio.sleep(0.05)
 
         asyncio.run(go())
-        assert plugin.turns == []
+        assert [t.text for t in plugin.turns] == ["Message from Xander (id 42):\nfixed typo"]
+
+    def test_an_edit_says_the_earlier_version_was_already_seen(self):
+        described = listener.describe_message_provenance(make_message("fixed typo", edit_date=1700000000))
+        assert "EDITED version of a message you have already been shown" in described
+        assert "don't repeat work you already did" in described
+
+    def test_an_edit_of_a_still_queued_message_replaces_it(self, monkeypatch):
+        """Both versions in one turn would answer the same message twice and
+        react to it twice - which is what made edits a skip to begin with."""
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0.2)
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_MAX_WAIT_SECONDS", 5)
+        plugin = RecordingPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_update(make_update(make_message("teh deploy", message_id=1)))
+            await lst.handle_update(make_update(
+                make_message("the deploy", message_id=1, edit_date=1700000000),
+                update_id=2, key="edited_message"))
+            await asyncio.sleep(0.5)
+
+        asyncio.run(go())
+        assert len(plugin.turns) == 1
+        assert plugin.turns[0].message_ids == [1]
+        assert "teh deploy" not in plugin.turns[-1].text
+        assert "the deploy" in plugin.turns[-1].text
 
 
 class TestSenderAttribution:
@@ -426,8 +455,8 @@ class TestSleep:
 
         asyncio.run(go())
         assert len(plugin.turns) == 1
-        assert "while you were out" in plugin.turns[0].text
-        assert "stay out of this conversation" in plugin.turns[0].text
+        assert "while you were out" in plugin.turns[-1].text
+        assert "stay out of this conversation" in plugin.turns[-1].text
 
     def test_sleep_zero_wakes_it_up(self, monkeypatch):
         monkeypatch.setattr(listener, "requests", FakeRequests())
@@ -567,7 +596,7 @@ class TestTranscription:
             await asyncio.sleep(0.05)
 
         asyncio.run(go())
-        assert "can you look at the deploy" in plugin.turns[0].text
+        assert "can you look at the deploy" in plugin.turns[-1].text
 
     def test_an_oversized_file_is_handed_over_as_a_path_instead(self, monkeypatch, tmp_path):
         monkeypatch.setattr(listener, "requests", FakeRequests())
@@ -855,3 +884,182 @@ class TestTranscriptLinkage:
 
         incoming = [e for e in common.read_transcript() if e["direction"] == "incoming"]
         assert incoming[-1]["message_id"] == 77
+
+
+class TestTurnTextHook:
+    def test_a_plugin_can_own_the_turn_layout(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        seen = []
+
+        class TemplatePlugin(RecordingPlugin):
+            async def build_turn_text(self, parts):
+                seen.append(parts)
+                return f"<<{parts.sender_name}|{parts.text}|{parts.extras}>>"
+
+        plugin = TemplatePlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_message(make_message("hoi", message_id=3, reply_to_message={
+                "message_id": 2, "from": {"id": 42, "first_name": "Xander"}, "text": "earlier"}))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        assert plugin.turns[-1].text.startswith("<<Xander|hoi|")
+        # The hook is handed the listener's own already-rendered extras, so
+        # a plugin that only wants a different wrapper re-derives nothing.
+        assert "This is a reply to" in seen[0].extras
+        assert (seen[0].chat_id, seen[0].message_id) == (100, 3)
+
+    def test_without_the_hook_the_default_layout_is_used(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        plugin = RecordingPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_message(make_message("hoi", message_id=1))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        assert plugin.turns[-1].text == "Message from Xander (id 42):\nhoi"
+
+    def test_a_failing_hook_falls_back_rather_than_losing_the_turn(self, monkeypatch):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+
+        class BrokenPlugin(RecordingPlugin):
+            async def build_turn_text(self, parts):
+                raise RuntimeError("template missing")
+
+        plugin = BrokenPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+
+        async def go():
+            await lst.handle_message(make_message("hoi", message_id=1))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+        assert plugin.turns[-1].text == "Message from Xander (id 42):\nhoi"
+
+
+class TestOutOfBandSends:
+    """Anything sent into a chat by something other than this listener - a
+    cron alert, a notification script, another session on the host - is on
+    screen for the person, and the session never saw it."""
+
+    def _listener(self, monkeypatch, prime=True):
+        monkeypatch.setattr(listener, "requests", FakeRequests())
+        monkeypatch.setattr(listener, "MESSAGE_BATCH_QUIET_SECONDS", 0)
+        plugin = RecordingPlugin()
+        lst = listener.Listener(plugin=plugin, api_base="http://fake", allowed_user_ids={42})
+        if prime:
+            # One turn first, so the chat has a cursor - everything below is
+            # about what arrives *between* turns.
+            self._turn(lst, text="earlier", message_id=900)
+            plugin.turns.clear()
+        return lst, plugin
+
+    def _turn(self, lst, text="hi", message_id=1):
+        async def go():
+            await lst.handle_message(make_message(text, message_id=message_id))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(go())
+
+    def test_an_out_of_band_send_reaches_the_next_turn(self, monkeypatch):
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+        common.append_transcript("outgoing", 100, text="deploy finished", sent_by="deploy-notify")
+
+        self._turn(lst)
+
+        text = plugin.turns[-1].text
+        assert "Sent into this chat since your last turn" in text
+        assert "deploy finished" in text
+        assert "deploy-notify" in text
+
+    def test_the_sessions_own_sends_are_not_echoed_back_at_it(self, monkeypatch):
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+        common.append_transcript("outgoing", 100, text="something I said", from_listener=True)
+
+        self._turn(lst)
+
+        assert "something I said" not in plugin.turns[-1].text
+        assert "Sent into this chat since your last turn" not in plugin.turns[-1].text
+
+    def test_nothing_out_of_band_means_no_block_at_all(self, monkeypatch):
+        lst, plugin = self._listener(monkeypatch)
+        self._turn(lst)
+        assert plugin.turns[-1].text == "Message from Xander (id 42):\nhi"
+
+    def test_an_out_of_band_send_does_not_itself_trigger_a_turn(self, monkeypatch):
+        """It stays silent until the person next says something, and is then
+        simply part of that turn's context."""
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+
+        common.append_transcript("outgoing", 100, text="nightly report ready", sent_by="cron")
+        asyncio.run(asyncio.sleep(0.05))
+        assert plugin.turns == []
+
+        self._turn(lst)
+        assert len(plugin.turns) == 1
+        assert "nightly report ready" in plugin.turns[-1].text
+
+    def test_a_sender_that_did_not_name_itself_is_still_reported(self, monkeypatch):
+        """Treating an unidentified send as the session's own would hide it
+        entirely - the harmless direction to be wrong in is the other one."""
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+        common.append_transcript("outgoing", 100, text="who said this")
+
+        self._turn(lst)
+
+        assert "who said this" in plugin.turns[-1].text
+        assert "unidentified process" in plugin.turns[-1].text
+
+    def test_an_out_of_band_send_is_reported_once_not_on_every_later_turn(self, monkeypatch):
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+        common.append_transcript("outgoing", 100, text="deploy finished", sent_by="deploy-notify")
+
+        self._turn(lst, message_id=1)
+        self._turn(lst, text="and?", message_id=2)
+
+        assert "deploy finished" in plugin.turns[0].text
+        assert "deploy finished" not in plugin.turns[1].text
+
+    def test_another_chats_out_of_band_send_stays_in_that_chat(self, monkeypatch):
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+        common.append_transcript("outgoing", 999, text="not for you", sent_by="cron")
+
+        self._turn(lst)
+
+        assert "not for you" not in plugin.turns[-1].text
+
+    def test_the_cursor_survives_a_restart(self, monkeypatch):
+        import telegram_listener.common as common
+        lst, plugin = self._listener(monkeypatch)
+        common.append_transcript("outgoing", 100, text="deploy finished", sent_by="deploy-notify")
+        self._turn(lst, message_id=1)
+
+        # A second Listener over the same data dir, as after a restart.
+        restarted = listener.Listener(plugin=RecordingPlugin(), api_base="http://fake", allowed_user_ids={42})
+        self._turn(restarted, text="and?", message_id=2)
+
+        assert "deploy finished" not in restarted.plugin.turns[-1].text
+
+    def test_a_chat_with_no_cursor_yet_is_treated_as_caught_up(self, monkeypatch):
+        """Starting from zero would dump every message ever sent to the chat
+        into its first turn."""
+        import telegram_listener.common as common
+        common.append_transcript("outgoing", 100, text="from before this listener existed", sent_by="cron")
+        lst, plugin = self._listener(monkeypatch, prime=False)
+
+        self._turn(lst)
+
+        assert "from before this listener existed" not in plugin.turns[-1].text

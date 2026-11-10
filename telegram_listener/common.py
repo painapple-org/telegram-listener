@@ -82,12 +82,27 @@ def _write_transcript_entry(entry):
 
 
 def append_transcript(direction, chat_id, text=None, file_path=None, sender_name=None, sender_id=None,
-                      message_id=None):
+                      message_id=None, sent_by=None, from_listener=False):
+    """Record one message in this chat's history.
+
+    `from_listener` is set by the listener's own send primitives and by
+    nothing else. It is what makes "did my own session send this?" an exact
+    question rather than a guess: anything written here without it came
+    from somewhere else, so a sender that forgets to identify itself is
+    treated as out-of-band, which is the harmless direction to be wrong in.
+    Anything sending into a chat from outside the listener should pass
+    `sent_by` naming itself, since the person reading the chat cannot tell
+    a cron alert from a session reply by looking at it.
+    """
     entry = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "direction": direction,
         "chat_id": chat_id,
     }
+    if from_listener:
+        entry["from_listener"] = True
+    if sent_by:
+        entry["sent_by"] = sent_by
     if text:
         entry["text"] = text
     if file_path:
@@ -124,7 +139,7 @@ def append_reaction(chat_id, message_id, emoji=None, reactor_name=None, reactor_
     _write_transcript_entry(entry)
 
 
-def read_transcript(limit=10):
+def _all_transcript_entries():
     if not os.path.isfile(TRANSCRIPT_FILE):
         return []
     entries = []
@@ -137,7 +152,27 @@ def read_transcript(limit=10):
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+    return entries
+
+
+def read_transcript(limit=10):
+    entries = _all_transcript_entries()
     return entries if limit is None else entries[-limit:]
+
+
+def read_transcript_since(start_index, chat_id=None):
+    """Entries recorded after `start_index`, and the index to resume from.
+
+    `start_index` counts entries already consumed, so the pair acts as a
+    durable cursor over the whole transcript. The returned index counts
+    every entry, not just the ones matching `chat_id` - otherwise a second
+    chat's traffic would silently shift this chat's cursor.
+    """
+    entries = _all_transcript_entries()
+    fresh = entries[start_index:]
+    if chat_id is not None:
+        fresh = [entry for entry in fresh if entry.get("chat_id") == chat_id]
+    return fresh, len(entries)
 
 
 def pending_confirmations_dir():
