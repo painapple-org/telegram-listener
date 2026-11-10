@@ -227,33 +227,44 @@ not one call per raw Telegram message.
 
 Concretely, it:
 
-- keeps one `ClaudeSDKClient` per `chat_id` (`self._clients`), persisting
-  each chat's session ID to disk (`_sessions_file()`) so a process restart
-  resumes the same conversation instead of starting over;
-- on `handle_turn`, sends a typing indicator, gets or creates that chat's
-  client, `query()`s it with `turn.text`, and streams every `AssistantMessage`
-  text block back via `api.send_message` as it arrives — this is the same
-  "the chat is a window onto the session" behavior
-  `respond_to_telegram.md` describes for spoor's own deployment;
-  - registers two of its own commands (`describe_commands()`): `/clear`
-  (disconnect and drop the persisted session, so the next message starts
-  fresh) and `/compact` (send `/compact` to the underlying session).
+- keeps one `ChatSession` per `chat_id`, each holding a `ClaudeSDKClient`
+  and a long-lived reader task, and persists each chat's session ID to
+  disk (`_sessions_file()`) so a process restart resumes the same
+  conversation instead of starting over;
+- streams every `AssistantMessage` text block back via `api.send_message`
+  as it arrives, threading the first one onto the message being answered —
+  the chat is a window onto the session, not a request/response endpoint;
+- posts a silent activity message while tools are running, edits it in
+  place as more tools fire, and deletes it the moment there is real text
+  to read;
+- compacts the context when it grows past a cap, compacts and disconnects
+  a chat that has gone idle (via the `on_start` hook, which is where it
+  starts its own watchdog), and retires a chat's session at the first
+  message of a new local day — telling the agent plainly that it has lost
+  the previous session rather than leaving it to invent what it cannot
+  remember;
+- registers its own commands (`describe_commands()`): the agent CLI's own
+  meta-commands (`/compact`, `/clear`, `/context`, `/cost`, `/recap`,
+  `/model`) passed straight through with the CLI's answer sent back, plus
+  `/cancel`;
+- implements `interrupt_turn`, so a turn that has overrun while someone is
+  waiting gets aborted and the new message read straight away, with a note
+  to the agent saying what was interrupted and which dispatched sub-agents
+  died with it.
 
-If you're wiring this repo into a spoor-style framework, this plugin is
+Every one of those is a fact about running an agent with a bounded context
+window, not a fact about Telegram — which is exactly why they live in the
+plugin and not in the listener core. The hooks they hang off (`on_start`,
+`interrupt_turn`, `live_context`) are all optional: a plugin that defines
+none of them still works, it just waits turns out instead of interrupting
+them and owns no background work.
+
+If you're wiring this repo into another agent framework, this plugin is
 usually the right starting point to copy and adapt rather than writing a
-plugin from scratch — change `DEFAULT_SYSTEM_PROMPT`, the model
-(`CLAUDE_AGENT_MODEL` in `.env`), and `COMMANDS`/`handle_command` to match
-the target framework's own conventions.
-
-It deliberately does **not** reproduce every feature of spoor's own
-`ChatSessionManager` — activity-bubble editing (collapsing tool calls into
-one live-updating "bezig" bubble), daily session rotation, context-size-
-triggered auto-compaction, `/sleep`/`/cancel` turn interruption, or voice
-replies. Those are real spoor product behaviors, not requirements of the
-plugin interface itself. Treat them as a checklist of extension points a
-production deployment likely wants, each implementable as an addition to a
-plugin's own `handle_turn`/`handle_command`/`describe_commands`, not as
-something missing from the interface that needs the listener core changed.
+plugin from scratch — change `DEFAULT_SYSTEM_PROMPT` (or set
+`CLAUDE_AGENT_SYSTEM_PROMPT`), the model (`CLAUDE_AGENT_MODEL`), and
+`COMMANDS`/`handle_command` to match the target framework's own
+conventions.
 
 ### If you're writing a new plugin instead
 
