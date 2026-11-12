@@ -60,6 +60,8 @@ class FakeListenerAPI:
         self.voice = []
         self.failures = []
         self.logs = []
+        self.dropped = []
+        self.queued_count = 0
         self._next_message_id = 1000
 
     def as_listener_api(self):
@@ -74,6 +76,7 @@ class FakeListenerAPI:
             delete_message=self._delete_message,
             send_voice=self._send_voice,
             report_failure=self._report_failure,
+            drop_queued=self._drop_queued,
             log=self.logs.append,
         )
 
@@ -104,6 +107,11 @@ class FakeListenerAPI:
 
     async def _report_failure(self, chat_id, what, exc=None):
         self.failures.append((chat_id, what, exc))
+
+    def _drop_queued(self, chat_id):
+        self.dropped.append(chat_id)
+        count, self.queued_count = self.queued_count, 0
+        return count
 
     def texts(self):
         return [text for _chat_id, text, _reply_to, _silent in self.sent]

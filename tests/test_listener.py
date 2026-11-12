@@ -1063,3 +1063,13 @@ class TestOutOfBandSends:
         self._turn(lst)
 
         assert "from before this listener existed" not in plugin.turns[-1].text
+
+
+class TestDropQueued:
+    def test_the_api_drops_this_chat_s_undelivered_batch(self):
+        lst = listener.Listener(plugin=RecordingPlugin(), api_base="http://fake", allowed_user_ids={42})
+        batcher = lst._batcher(100)
+        batcher.inbox = [(1, "a", "Xander", 42), (2, "b", "Xander", 42)]
+
+        assert lst._api().drop_queued(100) == 2
+        assert batcher.inbox == []

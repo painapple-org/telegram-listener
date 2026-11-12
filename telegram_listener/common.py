@@ -3,11 +3,11 @@
 This is a deliberately small subset of what `spoor`'s own
 `scripts/shared/telegram_common.py` provides: bot-API base resolution,
 transcript logging, and the pending-confirmation record used by callback
-queries. Spoor's own `activity_log`/dashboard-event plumbing does not live
-here - that's a spoor-specific integration, not something a generic
-listener needs. Anything downstream that wants an event notification gets
-it through the optional `ListenerAPI.on_event` callback instead (see
-`plugin.py`), never through a hard import of spoor's own module.
+queries. A deployment's own activity-feed/dashboard plumbing does not live
+here - that's a deployment-specific integration, not something a generic
+listener needs. Anything downstream that wants to mirror the conversation
+registers a `set_transcript_observer` callback instead (below), never a
+hard import of this module from the other direction.
 """
 
 import json
@@ -70,15 +70,46 @@ TRANSCRIPT_FILE = os.path.join(resolve_data_dir(), "telegram-listener", "transcr
 
 _TRANSCRIPT_LOCK = threading.Lock()
 
+_transcript_observer = None
+
+
+def set_transcript_observer(observer):
+    """Call `observer(direction, entry, byte_offset)` after every transcript
+    entry this process writes.
+
+    A deployment that mirrors the conversation somewhere else - an activity
+    feed, a dashboard, an audit index - needs to see every entry, including
+    the ones the listener itself writes (incoming messages, its own sends,
+    reactions). Wrapping the writers cannot do that, since the listener
+    calls `append_transcript` directly; this is the seam that can. The byte
+    offset is where the entry landed in `TRANSCRIPT_FILE`, so an observer
+    can deep-link straight at it instead of re-scanning the file.
+
+    `observer=None` removes it again. Set from the process that owns the
+    integration; the listener core never sets one itself.
+    """
+    global _transcript_observer
+    _transcript_observer = observer
+
 
 def _write_transcript_entry(entry):
     try:
         os.makedirs(os.path.dirname(TRANSCRIPT_FILE), exist_ok=True)
         with _TRANSCRIPT_LOCK:
+            byte_offset = os.path.getsize(TRANSCRIPT_FILE) if os.path.isfile(TRANSCRIPT_FILE) else 0
             with open(TRANSCRIPT_FILE, "a") as f:
                 f.write(json.dumps(entry) + "\n")
     except Exception as exc:
         print(f"telegram_listener.common: failed to append transcript entry ({exc!r}) - continuing anyway", file=sys.stderr)
+        return
+
+    if _transcript_observer is not None:
+        try:
+            _transcript_observer(entry["direction"], entry, byte_offset)
+        except Exception as exc:
+            # The observer is an integration on the side. The chat itself
+            # carries on, but this is said out loud rather than swallowed.
+            print(f"telegram_listener.common: transcript observer failed ({exc!r}) - the entry itself was written", file=sys.stderr)
 
 
 def append_transcript(direction, chat_id, text=None, file_path=None, sender_name=None, sender_id=None,
