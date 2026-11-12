@@ -101,11 +101,20 @@ chat's ID alongside the sender's. Comma-separate multiple:
 * `TELEGRAM_LISTENER_DATA_DIR` — optional, where the listener stores its
   offset/transcripts/sessions/downloaded files. When unset, `/data` if it
   exists, else `./data` (see `telegram_listener/common.py`).
+* `TELEGRAM_STT_ENDPOINT` / `TELEGRAM_TTS_ENDPOINT` — optional, and both
+  features are simply off while unset. With them set the listener
+  transcribes incoming voice/audio/video into the turn text, and registers
+  a `/voice` command that speaks text straight back. Both expect the
+  OpenAI audio API shape, so they point equally well at a box on your own
+  network or at a hosted provider. See `.env.example`.
 * `TELEGRAM_BOT_API_HOST` / `TELEGRAM_BOT_API_PORT`, `RAW_UPDATES_MAX_BYTES`,
-  and the `MESSAGE_BATCH_*` tunables — all optional, all documented in
+  the `MESSAGE_BATCH_*` tunables, `TURN_YIELD_GRACE_SECONDS`,
+  `SLEEP_DEFAULT_SECONDS`, `LIVE_CONTEXT_REFRESH_INTERVAL_SECONDS` and the
+  `CLAUDE_AGENT_*` plugin tunables — all optional, all documented in
   `.env.example` with their defaults owned by
-  `telegram_listener/listener.py` and `telegram_listener/common.py`. Don't
-  set any of them to get a first deployment running.
+  `telegram_listener/listener.py`, `telegram_listener/common.py` and
+  `plugins/claude_agent.py`. Don't set any of them to get a first
+  deployment running.
 
 ## 5. Put it together
 
