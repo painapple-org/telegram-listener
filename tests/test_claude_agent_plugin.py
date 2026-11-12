@@ -281,3 +281,32 @@ class TestCompaction:
         assert FakeClaudeSDKClient.instances[0].queries == ["/compact"]
         assert FakeClaudeSDKClient.instances[0].disconnected is True
         assert session.client is None
+
+
+class TestSubclassSeams:
+    def test_configure_options_gets_the_last_word_on_the_options(self, plugin_module):
+        class DeploymentPlugin(plugin_module.ClaudeAgentPlugin):
+            def configure_options(self, options):
+                options.cwd = "/srv/some-repo"
+
+        plugin = DeploymentPlugin(client_factory=FakeClaudeSDKClient, model="some-model")
+        api = FakeListenerAPI()
+        run_turn(plugin, api.as_listener_api(), make_turn())
+
+        options = FakeClaudeSDKClient.instances[0].options
+        assert options.cwd == "/srv/some-repo"
+        assert options.model == "some-model"
+
+    def test_a_subclass_owns_what_a_rotated_session_is_told(self, plugin_module):
+        class DeploymentPlugin(plugin_module.ClaudeAgentPlugin):
+            def fresh_session_note(self, today, last_day):
+                return f"[look it up in our own records, {today} replaces {last_day}]\n\n"
+
+        plugin = DeploymentPlugin(client_factory=FakeClaudeSDKClient)
+        session = plugin.session(1)
+        api = FakeListenerAPI().as_listener_api()
+        plugin_module._save_sessions({"1": {"session_id": "yesterday", "started": "1999-01-01", "previous": []}})
+
+        asyncio.run(session.maybe_rotate_session(api))
+
+        assert session.fresh_session_note.startswith("[look it up in our own records,")

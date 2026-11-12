@@ -166,6 +166,15 @@ Point `DISPATCH_PLUGIN` at `module.path:factory_function`, where
 `factory_function()` returns an instance of your plugin. See
 `plugins/claude_agent.py` for a complete example.
 
+If what you want is a Claude session of your own rather than a different
+kind of dispatch entirely, subclass `ClaudeAgentPlugin` from that module
+instead of copying it: `configure_options` is where this deployment's
+agent is configured (working directory, extra readable directories, a
+specific CLI binary), `fresh_session_note` is what a session rotated onto
+a new day is told about the one it replaces, and the `DispatchPlugin`
+hooks above cover the rest. Copying the file to change four things is how
+a fork starts.
+
 Every `ListenerAPI` send primitive is awaitable — they wrap blocking HTTP
 calls, and running one inline would stall the shared poll loop and every
 other chat for the length of the request. `log` and `drop_queued` (throw

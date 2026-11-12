@@ -6,6 +6,17 @@ they arrive, implemented purely as a `DispatchPlugin` and wired up through
 `DISPATCH_PLUGIN=plugins.claude_agent:build_plugin` rather than being
 hard-coded into the listener.
 
+It is also meant to be subclassed. A deployment running a Claude session
+of its own needs none of this session machinery rewritten - what it needs
+is its own turn text, its own live context, its own commands and its own
+agent configuration. So `ClaudeAgentPlugin` keeps everything specific to
+*running an agent* here and leaves exactly those seams open:
+`configure_options` (anything about this deployment's agent -
+working directory, extra readable directories, which CLI binary),
+`fresh_session_note`, plus the `DispatchPlugin` hooks themselves.
+Copying this file to change four things is the drift this package exists
+to prevent.
+
 What it does on top of bare session persistence - and why each of those is
 here rather than in the listener:
 
@@ -225,6 +236,7 @@ class ChatSession:
             )
             if self.plugin.model:
                 options.model = self.plugin.model
+            self.plugin.configure_options(options)
             if existing_id:
                 options.resume = existing_id
                 self.session_id = existing_id
@@ -496,7 +508,7 @@ class ChatSession:
         _save_sessions(sessions)
         api.log(f"chat {self.chat_id}: new day ({today}), retiring session {retiring} "
                 f"(last used {record['started']}) and starting fresh")
-        self.fresh_session_note = fresh_session_note(today, record["started"] or "an earlier day")
+        self.fresh_session_note = self.plugin.fresh_session_note(today, record["started"] or "an earlier day")
         await self.disconnect()
 
     async def _run_compaction(self, api, on_failure=None):
@@ -587,6 +599,19 @@ class ClaudeAgentPlugin:
 
     def describe_commands(self):
         return list(COMMANDS)
+
+    def configure_options(self, options):
+        """Last word on the `ClaudeAgentOptions` a chat's session connects
+        with. Everything about *this deployment's* agent rather than about
+        running an agent at all - a working directory, extra readable
+        directories, a specific CLI binary - belongs in an override of
+        this, not in a copy of this file."""
+
+    def fresh_session_note(self, today, last_day):
+        """What a session rotated onto a new day is told about the one it
+        replaces. Overridable because where a deployment keeps the record
+        it should look things up in is the deployment's own business."""
+        return fresh_session_note(today, last_day)
 
     def session(self, chat_id):
         session = self._sessions.get(chat_id)
