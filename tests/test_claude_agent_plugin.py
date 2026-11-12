@@ -199,6 +199,14 @@ class TestCommands:
         asyncio.run(plugin.handle_command(9, 2, "clear", "", api.as_listener_api()))
         assert "9" not in plugin_module._load_sessions()
 
+    def test_cancel_drops_messages_still_waiting_out_the_quiet_period(self, plugin_module):
+        plugin = plugin_module.ClaudeAgentPlugin(client_factory=FakeClaudeSDKClient)
+        api = FakeListenerAPI()
+        api.queued_count = 3
+        asyncio.run(plugin.handle_command(1, 1, "cancel", "", api.as_listener_api()))
+        assert api.dropped == [1]
+        assert api.texts() == ["Nothing in flight. Dropped 3 message(s) that hadn't been delivered yet."]
+
     def test_cancel_with_nothing_running_says_so(self, plugin_module):
         plugin = plugin_module.ClaudeAgentPlugin(client_factory=FakeClaudeSDKClient)
         api = FakeListenerAPI()

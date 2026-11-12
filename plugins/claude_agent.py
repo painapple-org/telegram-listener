@@ -455,8 +455,15 @@ class ChatSession:
         return note
 
     async def cancel_pending(self, message_id, api):
+        # Messages that arrived while the cancelled work ran are part of
+        # what is being cancelled - answering them afterwards replies to a
+        # conversation the person has already walked away from.
+        dropped = api.drop_queued(self.chat_id)
         if self.client is None or not self.pending:
-            await api.send_message(self.chat_id, "Nothing in flight to cancel.")
+            await api.send_message(
+                self.chat_id,
+                f"Nothing in flight. Dropped {dropped} message(s) that hadn't been delivered yet."
+                if dropped else "Nothing in flight to cancel.")
             return
         try:
             await self.client.interrupt()

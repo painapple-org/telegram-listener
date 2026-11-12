@@ -349,11 +349,18 @@ def resolve_bot_identity(api_base):
 STT_ENDPOINT = os.environ.get("TELEGRAM_STT_ENDPOINT", "")
 STT_MODEL = os.environ.get("TELEGRAM_STT_MODEL", "whisper-1")
 STT_TIMEOUT = int(os.environ.get("TELEGRAM_STT_TIMEOUT", 900))
+# Separate connect timeout, because the read timeout has to be generous
+# enough to transcribe a long recording. Without it, an endpoint that
+# resolves but is not up (a sleeping box on a home network, a tailnet host
+# that is offline) holds the upload open for the full read timeout, and the
+# person who sent the voice note hears nothing for that whole time.
+STT_CONNECT_TIMEOUT = int(os.environ.get("TELEGRAM_STT_CONNECT_TIMEOUT", 10))
 
 TTS_ENDPOINT = os.environ.get("TELEGRAM_TTS_ENDPOINT", "")
 TTS_MODEL = os.environ.get("TELEGRAM_TTS_MODEL", "tts-1")
 TTS_VOICE = os.environ.get("TELEGRAM_TTS_VOICE", "alloy")
 TTS_TIMEOUT = int(os.environ.get("TELEGRAM_TTS_TIMEOUT", 120))
+TTS_CONNECT_TIMEOUT = int(os.environ.get("TELEGRAM_TTS_CONNECT_TIMEOUT", 10))
 
 # Transcribing an hour of video is slow and rarely what anyone wanted when
 # they dropped a large file into a chat; above this the raw file is handed
@@ -376,7 +383,8 @@ def tts_enabled():
 def transcribe_media(local_path):
     with open(local_path, "rb") as f:
         resp = requests.post(
-            STT_ENDPOINT, files={"file": f}, data={"model": STT_MODEL}, timeout=STT_TIMEOUT,
+            STT_ENDPOINT, files={"file": f}, data={"model": STT_MODEL},
+            timeout=(STT_CONNECT_TIMEOUT, STT_TIMEOUT),
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"speech-to-text failed: HTTP {resp.status_code} {(resp.text or '')[:500]!r}")
@@ -406,7 +414,7 @@ def synthesize_speech(text):
         resp = requests.post(
             TTS_ENDPOINT,
             json={"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "opus"},
-            timeout=TTS_TIMEOUT,
+            timeout=(TTS_CONNECT_TIMEOUT, TTS_TIMEOUT),
         )
         if resp.status_code >= 400:
             log(f"synthesize_speech: HTTP {resp.status_code} {(resp.text or '')[:500]!r}")
@@ -1204,6 +1212,7 @@ class Listener:
                 send_voice_message, chat_id, text, self.api_base, reply_to_message_id),
             report_failure=lambda chat_id, what, exc=None: asyncio.to_thread(
                 report_failure, chat_id, what, self.api_base, exc),
+            drop_queued=lambda chat_id: self._batcher(chat_id).drop_queued(),
             log=log,
         )
 

@@ -91,12 +91,14 @@ class ListenerAPI:
     # Tell the humans in the chat that something broke, as well as the log.
     # A log file alone is silence.
     report_failure: Callable[..., Awaitable[None]]
+    # Throw away whatever is batched for this chat but not yet delivered,
+    # returning how many messages were dropped. Synchronous: it only
+    # touches the listener's own in-memory batch. A plugin cancelling a
+    # turn needs this - messages that arrived while the cancelled work ran
+    # are part of what is being cancelled, and delivering them afterwards
+    # answers a conversation the person has already abandoned.
+    drop_queued: Callable[[int], int]
     log: Callable[[str], None]
-    # Optional event-notification hook (e.g. for a dashboard/activity feed
-    # downstream). None unless the process wiring it up actually wants one -
-    # the listener core never assumes one exists, and a plugin must treat a
-    # missing hook the same as a no-op one.
-    on_event: Optional[Callable[[str, dict], None]] = None
 
 
 class DispatchPlugin(Protocol):

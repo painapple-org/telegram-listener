@@ -128,6 +128,19 @@ common.append_transcript("outgoing", chat_id, text=body, sent_by="deploy-notify"
 recognize. Omitting the call entirely means the message reaches the chat
 and the plugin never learns it happened.
 
+To mirror the conversation somewhere else as well — an activity feed, a
+dashboard, an audit index — register an observer instead of wrapping the
+writers, which would miss everything the listener itself records:
+
+```python
+common.set_transcript_observer(lambda direction, entry, byte_offset: ...)
+```
+
+It is called after each entry is written, with the byte offset the entry
+landed at in `common.TRANSCRIPT_FILE`, so the observer can link straight
+at it. An observer that raises is reported and does not take the chat
+down with it.
+
 ## Writing your own plugin
 
 Implement `telegram_listener.plugin.DispatchPlugin` — read that module for
@@ -155,8 +168,10 @@ Point `DISPATCH_PLUGIN` at `module.path:factory_function`, where
 
 Every `ListenerAPI` send primitive is awaitable — they wrap blocking HTTP
 calls, and running one inline would stall the shared poll loop and every
-other chat for the length of the request. `log` is the one synchronous
-member. The listener guarantees one `handle_turn` at a time per chat, so a
+other chat for the length of the request. `log` and `drop_queued` (throw
+away this chat's batched-but-undelivered messages — what a plugin's own
+cancel command needs, since those messages are part of what is being
+cancelled) are the two synchronous members. The listener guarantees one `handle_turn` at a time per chat, so a
 plugin's own per-chat state needs no locking of its own, and it holds that
 turn open until `handle_turn` returns — so a plugin that dispatches work
 asynchronously must await it rather than returning early.

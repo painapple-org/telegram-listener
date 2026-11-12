@@ -1,3 +1,4 @@
+import json
 import os
 
 import telegram_listener.common as common
@@ -90,3 +91,39 @@ class TestTranscriptCursor:
         fresh, index = common.read_transcript_since(0, chat_id=100)
         assert [e["text"] for e in fresh] == ["mine"]
         assert index == 2
+
+
+class TestTranscriptObserver:
+    def test_observer_sees_every_entry_with_the_offset_it_landed_at(self, isolated_data_dir):
+        import telegram_listener.common as common
+
+        seen = []
+        common.set_transcript_observer(lambda direction, entry, offset: seen.append((direction, entry, offset)))
+        try:
+            common.append_transcript("incoming", 100, text="hello", sender_name="Alice")
+            common.append_transcript("outgoing", 100, text="hi", from_listener=True)
+            common.append_reaction(100, 7, emoji="\U0001F44D", reactor_name="Alice")
+        finally:
+            common.set_transcript_observer(None)
+
+        assert [direction for direction, _entry, _offset in seen] == ["incoming", "outgoing", "reaction"]
+        assert seen[0][2] == 0
+        with open(common.TRANSCRIPT_FILE, "rb") as f:
+            raw = f.read()
+        # Each recorded offset is where that entry's own line starts.
+        for _direction, entry, offset in seen:
+            assert json.loads(raw[offset:].split(b"\n", 1)[0]) == entry
+
+    def test_a_failing_observer_does_not_lose_the_entry(self, isolated_data_dir):
+        import telegram_listener.common as common
+
+        def boom(direction, entry, offset):
+            raise RuntimeError("downstream is down")
+
+        common.set_transcript_observer(boom)
+        try:
+            common.append_transcript("incoming", 100, text="still lands")
+        finally:
+            common.set_transcript_observer(None)
+
+        assert [entry["text"] for entry in common.read_transcript(limit=None)] == ["still lands"]

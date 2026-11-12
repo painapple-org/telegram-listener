@@ -187,14 +187,14 @@ The interface, in short:
 - **`ListenerAPI`** — what a plugin acts back through:
   `send_message(chat_id, text)`, `send_typing(chat_id)`,
   `set_reaction(chat_id, message_id, emoji)`,
-  `send_document(chat_id, path, caption=None)`, `log(text)`, and an
-  optional `on_event(name, payload)` hook for a downstream
-  dashboard/activity feed (`None` unless the process wiring the plugin up
-  actually wants one — a plugin must treat a missing hook as a no-op, never
-  assume it exists). **Every send primitive is awaitable and must be
+  `send_document(chat_id, path, caption=None)`, `edit_message`,
+  `delete_message`, `send_voice`, `report_failure`,
+  `drop_queued(chat_id)` (throw away this chat's batched-but-undelivered
+  messages, returning how many) and `log(text)`. **Every send primitive is
+  awaitable and must be
   awaited** — they wrap blocking HTTP calls, so a forgotten `await` both
   loses the call and, run inline, would stall the poll loop and every other
-  chat. `log` is the one synchronous member. `send_document` is uncapped
+  chat. `log` and `drop_queued` are the two synchronous members (neither does any I/O). `send_document` is uncapped
   past whatever the self-hosted Bot API server allows, which is the whole
   reason this package talks to one rather than to api.telegram.org.
 - **Concurrency guarantee** — the listener runs at most one `handle_turn`
